@@ -1,5 +1,6 @@
 #!/usr/bin/env ruby
 require 'json'
+require 'optparse'
 
 class InvalidSpecError < StandardError
   def initialize(msg)
@@ -21,55 +22,16 @@ class RpmSpecParser
 
   CONDITIONAL_MACROS  = ['%if', '%else', '%endif']
 
-  # Supported options separated by comma
-  # o   => -o
-  # o:  => -o xxx
-  # o:* => -o a -o b -o c ...
-  # :   => xxx
-  # :*  => xxx1 xxx2 xxx3 ...
-  SECTION_OPTIONS = {
-    '%description' => 'n,:',  # -n: Do NOT prefix the primary package name
-    '%files' => 'f:*,n,:',     # -f: read file list from a file
-    '%changelog' => 'n,:',
-    '%pre' => 'p:,n,:',       # -p: Run given program
-    '%preun' => 'p:,n,:',
-    '%post' => 'p:,n,:',
-    '%postun' => 'p:,n,:',
-  }
-
-  # Parse section line
-  def self.parse_section(section_name, args)
-    ret = {'name' => section_name}
-    return ret if args.nil?
-    # Parse args
-    i = 0
-    arg_list = args.split(' ')
-    if self.class.SECTION_OPTIONS.has_key?(section_name)
-      while i < arg_list.length
-        i += 1
-      end
-    end
-    return ret
-  end
-
-  # Split section line into section name and args
+  # Initialize the parser with a spec file
   # Params:
-  #   line - The line to be parsed. Example: "%package doc"
-  # Return:
-  #   section - Macro name. Example: "%package"
-  #   args    - Arguments, such as subpackage name, program to run
-  def self.get_section_and_args(line)
-    if not line.start_with?('%')
-      return nil, nil
+  #   spec_file - path of the spec file
+  def initialize(spec_file)
+    unless File.exists?(spec_file)
+      raise InvalidSpecError.new("#{spec_file}: No such file")
     end
-    line =~ /^(%\w+)\s*(.*)$/
-    if $~.nil?
-      return nil, nil
-    end
-    # get macro name and its value
-    section = $~[1]
-    args = ($~[2].length == 0) ? nil : $~[2]
-    return section, args
+    @path   = spec_file
+    @macros = {}
+    @vars   = {}
   end
 
   # Detect macro type
@@ -79,7 +41,7 @@ class RpmSpecParser
   #   :conditional  - %if, %ifarch, %ifos, %else, %endif, etc
   #   :section      - %build, %prep, %files, etc
   #   nil           - considered as normal lines
-  def self.macro_type(macro)
+  def macro_type(macro)
     # Conditional macros are ignored
     CONDITIONAL_MACROS.each do |pattern|
       return :conditional if macro.start_with?(pattern)
@@ -91,6 +53,121 @@ class RpmSpecParser
     # Other macros like %setup, %dir
     # will be considered as normal lines
     return nil
+  end
+
+  # Read and split spec file into sections
+  # Each section starts with a section line, such as '%package doc', '%build'
+  def read_sections
+    @sections = []
+    begin
+      f = File.new(@path)
+    rescue IOError => e
+      raise IOError.new("Failed to read #{@path}")
+    end
+    section = ['%package'] # fake section for the main package
+    f.each_line do |line|
+      line = line.strip
+      # Skip empty lines and comments
+      next if line.length == 0 or line.start_with?('#')
+      # Handle section lines(e.g. %package doc)
+      section_name, args = line.start_with?('%') ? RpmSpecParser.get_section_and_args(line) : [nil, nil]
+      if section_name.nil? or self.macro_type(section_name) != :section
+        section.push(line)
+      else
+        # Save the previous section
+        @sections.push(section.join("\n"))
+        # Create a new section
+        section = [line]
+      end
+    end
+    # Save the last section
+    @sections.push(section.join("\n"))
+    # Close the file
+    f.close
+  end
+
+  # Get value of macro
+  def get_macro_value(macro)
+  end
+
+  # Expand macros to their values
+  # Params:
+  #   str - The string to be expanded
+  # Return:
+  #   ret - New string with macros expanded
+  def expand_macros(str)
+    ret = String.new(str)
+    macros = ret.scan(/%\{[\w_\-:]\}/)
+    macros.each do |key|
+      if @macros.has_key?(key)
+        ret.gsub!(/%\{#{key}\}/, @macros[key].to_s)
+      end
+    end
+    return ret
+  end
+
+  # Split section line into section name and args
+  # Params:
+  #   line - The line to be parsed. Example: "%package doc"
+  # Return:
+  #   section - Macro name. Example: "%package"
+  #   args    - Arguments, such as subpackage name, program to run
+  def get_section_and_args(line)
+    return nil, nil unless line.start_with?('%')
+    line =~ /^(%\w+)\s*(.*)$/
+    return nil, nil if $~.nil?
+    # get macro name and its value
+    section = $~[1]
+    args = ($~[2].length == 0) ? nil : $~[2]
+    return section, args
+  end
+
+  # Parse the args of a section
+  # Params:
+  #   section_name  - Name of the section, including the % sign at the beginning
+  #   arg_list      - Array of argument list(similar to ARGV)
+  # Return:
+  #   parsed_args   - Parsed arguments, e.g. {:args => [], :opts => {}}
+  def parse_section_args!(section_name, arg_list)
+    parsed_args = {:args => [], :opts => {}}
+    opt_parser = OptionParser.new do |opts|
+      opts.on('-n', 'Do not include primary package name in subpackage name') do
+        if ['%description', '%files', '%changelog',
+            '%pre', '%preun', '%post', '%postun'].include?(section_name)
+          parsed_args[:opts]['-n'] = true
+        end
+      end
+
+      opts.on('-f [FILE]', String, 'Read file list from a file') do |file|
+        if section_name == '%files'
+          file = self.expand_macros(file)
+          parsed_args[:opts]['-f'] = [] if parsed_args[:opts]['-f'].nil?
+          parsed_args[:opts]['-f'].push(file)
+        end
+      end
+
+      opts.on('-p [PROGRAM]', String, 'Program to run') do |program|
+        if ['%pre', '%preun', '%post', '%postun'].include?(section_name)
+          program = self.expand_macros(program)
+          parsed_args[:opts]['-p'] = program
+        end
+      end
+    end
+    opt_parser.parse!(arg_list)
+    # Ignore other options
+    parsed_args[:args] = arg_list.select do |item|
+      item.start_with?('-') ? false : true
+    end
+    parsed_args[:args].map! do |item|
+      self.expand_macros(item)
+    end
+    return parsed_args
+  end
+
+  def get_subpackage_name(parsed_args, section)
+    if parsed_args[:opts]['-n'] == true
+    else
+    end
   end
 
   def parse_section(macro_line)
@@ -117,50 +194,6 @@ class RpmSpecParser
       end
     end
   end
-
-  def initialize(spec_file)
-    unless File.file?(spec_file)
-      raise InvalidSpecError.new("#{spec_file}: Not an ordinary file")
-    end
-    unless File.readable?(spec_file)
-      raise InvalidSpecError.new("#{spec_file}: Couldn't read RPM spec file")
-    end
-    @path = spec_file
-  end
-
-  def read_sections
-    @sections = []
-    begin
-      f = File.new(@path)
-    rescue IOError => e
-      raise IOError.new("Failed to read #{@path}")
-    end
-    section = ['%package'] # fake section for the main package
-    f.each_line do |line|
-      line = line.strip
-      # Skip empty lines and comments
-      next if line.length == 0 or line.start_with?('#')
-      # Handle section lines(e.g. %package doc)
-      section_name, args = line.start_with?('%') ? RpmSpecParser.get_section_and_args(line) : [nil, nil]
-      if section_name.nil? or RpmSpecParser.macro_type(section_name) != :section
-        section.push(line)
-      else
-        # Save the previous section
-        @sections.push(section.join("\n"))
-        # Create a new section
-        section = [line]
-      end
-    end
-    # Save the last section
-    @sections.push(section.join("\n"))
-    # Close the file
-    f.close
-  end
 end
 
-parser = RpmSpecParser.new('qa_test_apache.spec')
-parser.read_sections
-parser.sections.each do |section|
-  puts section
-  puts "=" * 80
-end
+puts RpmSpecParser.parse_section_args('%files', '-f list -f baka  -n mydoc'.split(' '))
