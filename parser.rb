@@ -26,6 +26,7 @@ class RpmSpecParser
   # o:  => -o xxx
   # o:* => -o a -o b -o c ...
   # :   => xxx
+  # :*  => xxx1 xxx2 xxx3 ...
   SECTION_OPTIONS = {
     '%description' => 'n,:',  # -n: Do NOT prefix the primary package name
     '%files' => 'f:*,n,:',     # -f: read file list from a file
@@ -36,7 +37,22 @@ class RpmSpecParser
     '%postun' => 'p:,n,:',
   }
 
-  # Parse section line into section name and args
+  # Parse section line
+  def self.parse_section(section_name, args)
+    ret = {'name' => section_name}
+    return ret if args.nil?
+    # Parse args
+    i = 0
+    arg_list = args.split(' ')
+    if self.class.SECTION_OPTIONS.has_key?(section_name)
+      while i < arg_list.length
+        i += 1
+      end
+    end
+    return ret
+  end
+
+  # Split section line into section name and args
   # Params:
   #   line - The line to be parsed. Example: "%package doc"
   # Return:
@@ -81,7 +97,7 @@ class RpmSpecParser
     res = {}
     macro_line =~ /^(%\w+)\s*(.*)$/
     if $~.nil?
-      raise InvalidSpecError.new(@path, @line_num, "Invalid macro line #{macro_line}")
+      raise InvalidSpecError.new("#{@path}: Invalid macro line #{macro_line}")
     end
     # get macro and its args
     res['name'] = $~[1]
@@ -104,10 +120,10 @@ class RpmSpecParser
 
   def initialize(spec_file)
     unless File.file?(spec_file)
-      raise InvalidSpecError.new(spec_file, nil, "Not an ordinary file")
+      raise InvalidSpecError.new("#{spec_file}: Not an ordinary file")
     end
     unless File.readable?(spec_file)
-      raise InvalidSpecError.new(spec_file, nil, "Couldn't read RPM spec file")
+      raise InvalidSpecError.new("#{spec_file}: Couldn't read RPM spec file")
     end
     @path = spec_file
   end
