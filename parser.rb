@@ -32,6 +32,7 @@ class RpmSpecParser
     @path   = spec_file
     @macros = {}
     @vars   = {}
+    @tags   = {}
   end
 
   # Detect macro type
@@ -70,7 +71,7 @@ class RpmSpecParser
       # Skip empty lines and comments
       next if line.length == 0 or line.start_with?('#')
       # Handle section lines(e.g. %package doc)
-      section_name, args = line.start_with?('%') ? RpmSpecParser.get_section_and_args(line) : [nil, nil]
+      section_name, args = line.start_with?('%') ? self.get_section_and_args(line) : [nil, nil]
       if section_name.nil? or self.macro_type(section_name) != :section
         section.push(line)
       else
@@ -86,8 +87,49 @@ class RpmSpecParser
     f.close
   end
 
+  # Get tag value
+  # Params:
+  #   package - Name of the package. For default package, it should be 'main'
+  #   tag     - Tag name, e.g. Name, Version, Release, Requires
+  def get_tag_value(package, tag)
+    package = self.get_macro_value('name') if package.nil? or package == ''
+    return nil if @tags[package].nil?
+    return @tags[package][tag]
+  end
+
+  # Set tag value
+  # Params:
+  #   package - Name of the package. For default package, it should be 'main'
+  #   tag     - Tag name, e.g. Name, Version, Release, Requires
+  #   value   - Value of the tag
+  def set_tag_value(package, tag, value)
+    @tags[package] = {} if @tags[package].nil?
+    @tags[package][tag] = value
+    return value
+  end
+
+  # Set value of macro
+  def set_macro_value(macro, value)
+    if macro =~ /^S:(\d+)$/
+      @macros["SOURCE#{$~[1]}"] = value
+    elsif macro =~ /^P:(\d+)$/
+      @macros["PATCH#{$~[1]}"] = value
+    else
+      @macros[macro] = value
+    end
+    return value
+  end
+
   # Get value of macro
+  # Source macros like %{S:1}, %{S:2} will be converted to %{SOURCE1}, %{SOURCE2}
   def get_macro_value(macro)
+    if macro =~ /^S:(\d+)$/
+      return @macros["SOURCE#{$~[1]}"]
+    end
+    if macro =~ /^P:(\d+)$/
+      return @macros["PATCH#{$~[1]}"]
+    end
+    return @macros[macro]
   end
 
   # Expand macros to their values
@@ -99,8 +141,9 @@ class RpmSpecParser
     ret = String.new(str)
     macros = ret.scan(/%\{[\w_\-:]\}/)
     macros.each do |key|
-      if @macros.has_key?(key)
-        ret.gsub!(/%\{#{key}\}/, @macros[key].to_s)
+      value = self.get_macro_value(key)
+      unless value.nil?
+        ret.gsub!(/%\{#{key}\}/, value.to_s)
       end
     end
     return ret
@@ -158,19 +201,61 @@ class RpmSpecParser
     parsed_args[:args] = arg_list.select do |item|
       item.start_with?('-') ? false : true
     end
+    # Expand macros
     parsed_args[:args].map! do |item|
       self.expand_macros(item)
     end
     return parsed_args
   end
 
-  def get_subpackage_name(parsed_args, section)
-    if parsed_args[:opts]['-n'] == true
+  def get_package_name(line_or_parsed_args)
+    if line_or_parsed_args.instance_of?(String)
+      section_name, args = self.get_section_and_args(line_or_parsed_args)
+      line_or_parsed_args = self.parse_section_args!(section_name, args.split(' '))
+    end
+    arg = line_or_parsed_args[:args][-1]
+    if line_or_parsed_args[:opts]['-n'] == true
+      return arg.nil? ? 'main' : arg
     else
+      name = self.get_macro_value('name')
+      raise InvalidSpecError.new("get_package_name: Failed to get main package name")
+      return arg.nil? ? 'main' : "#{name}-#{arg}"
     end
   end
 
-  def parse_section(macro_line)
+  # Parse %packge section
+  def parse_package_section(section)
+    iter = section.each_line
+    # Section line
+    line = iter.next()
+    section, args = self.get_section_and_args(line)
+    raise InvalidSpecError.new("parse_package_section: '#{section}' is not a %package section")
+    parsed_args = self.parse_section_args!(section, args)
+    package = self.get_package_name(line)
+    loop do
+      begin
+        line = iter.next()
+      rescue StopIteration
+        break
+      end
+      line =~ /^(\w+)\s*:\s*([^\s].*)$/
+      next if $~.nil?
+      # Get tag name and value
+      tag = $~[1]
+      value = $~[2]
+      # Set macro values if it's main package
+      if package == 'main'
+        if ['Name', 'Version', 'Release'].include?(tag)
+          self.set_macro_value(tag.downcase, value) 
+          self.set_macro_value('ver', value) if tag == 'Version'
+        end
+      end
+      # Set tag name
+      self.set_tag_value(package, tag, value)
+    end
+  end
+
+  def parse_section(section)
     res = {}
     macro_line =~ /^(%\w+)\s*(.*)$/
     if $~.nil?
@@ -196,4 +281,5 @@ class RpmSpecParser
   end
 end
 
-puts RpmSpecParser.parse_section_args('%files', '-f list -f baka  -n mydoc'.split(' '))
+parser = RpmSpecParser.new('../spec-parser/foo.spec')
+puts parser.get_package_name({:args => ['foo', 'doc'], :opts => {'-n' => false}})
