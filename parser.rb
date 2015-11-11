@@ -71,8 +71,8 @@ class RpmSpecParser
       # Skip empty lines and comments
       next if line.length == 0 or line.start_with?('#')
       # Handle section lines(e.g. %package doc)
-      section_name, args = line.start_with?('%') ? self.get_section_and_args(line) : [nil, nil]
-      if section_name.nil? or self.macro_type(section_name) != :section
+      section, args = line.start_with?('%') ? self.get_section_and_args(line) : [nil, nil]
+      if section.nil? or self.macro_type(section) != :section
         section.push(line)
       else
         # Save the previous section
@@ -167,22 +167,22 @@ class RpmSpecParser
 
   # Parse the args of a section
   # Params:
-  #   section_name  - Name of the section, including the % sign at the beginning
+  #   section  - Name of the section, including the % sign at the beginning
   #   arg_list      - Array of argument list(similar to ARGV)
   # Return:
   #   parsed_args   - Parsed arguments, e.g. {:args => [], :opts => {}}
-  def parse_section_args!(section_name, arg_list)
+  def parse_section_args!(section, arg_list)
     parsed_args = {:args => [], :opts => {}}
     opt_parser = OptionParser.new do |opts|
       opts.on('-n', 'Do not include primary package name in subpackage name') do
         if ['%description', '%files', '%changelog',
-            '%pre', '%preun', '%post', '%postun'].include?(section_name)
+            '%pre', '%preun', '%post', '%postun'].include?(section)
           parsed_args[:opts]['-n'] = true
         end
       end
 
       opts.on('-f [FILE]', String, 'Read file list from a file') do |file|
-        if section_name == '%files'
+        if section == '%files'
           file = self.expand_macros(file)
           parsed_args[:opts]['-f'] = [] if parsed_args[:opts]['-f'].nil?
           parsed_args[:opts]['-f'].push(file)
@@ -190,7 +190,7 @@ class RpmSpecParser
       end
 
       opts.on('-p [PROGRAM]', String, 'Program to run') do |program|
-        if ['%pre', '%preun', '%post', '%postun'].include?(section_name)
+        if ['%pre', '%preun', '%post', '%postun'].include?(section)
           program = self.expand_macros(program)
           parsed_args[:opts]['-p'] = program
         end
@@ -210,8 +210,8 @@ class RpmSpecParser
 
   def get_package_name(line_or_parsed_args)
     if line_or_parsed_args.instance_of?(String)
-      section_name, args = self.get_section_and_args(line_or_parsed_args)
-      line_or_parsed_args = self.parse_section_args!(section_name, args.split(' '))
+      section, args = self.get_section_and_args(line_or_parsed_args)
+      line_or_parsed_args = self.parse_section_args!(section, args.split(' '))
     end
     arg = line_or_parsed_args[:args][-1]
     if line_or_parsed_args[:opts]['-n'] == true
@@ -255,28 +255,28 @@ class RpmSpecParser
     end
   end
 
-  def parse_section(section)
-    res = {}
-    macro_line =~ /^(%\w+)\s*(.*)$/
-    if $~.nil?
-      raise InvalidSpecError.new("#{@path}: Invalid macro line #{macro_line}")
-    end
-    # get macro and its args
-    res['name'] = $~[1]
-    args = ($~[2].length == 0) ? nil : $~[2]
-    unless args.nil?
-      no_name = false
-      array = args.split(' ')
-      i = 0
-      while i < array.length
-        if array[i] == '-p'
-          res[array[i]] = array[i+1]
-          i += 1
-        elsif array[i] == '-n'
-          no_name = true
-        end
-        i += 1
+  # Parse %packge section
+  def parse_normal_section(section)
+    iter = section.each_line
+    # Section line
+    line = iter.next()
+    section, args = self.get_section_and_args(line)
+    raise InvalidSpecError.new("parse_package_section: '#{section}' is not a %package section")
+    parsed_args = self.parse_section_args!(section, args)
+    package = self.get_package_name(line)
+    loop do
+      begin
+        line = iter.next()
+      rescue StopIteration
+        break
       end
+    end
+  end
+
+
+  def parse_section(section)
+    if section.start_with?('%package')
+      return self.parse_package_section(section)
     end
   end
 end
