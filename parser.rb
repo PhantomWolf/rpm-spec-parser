@@ -59,30 +59,37 @@ class RpmSpecParser
   # Read and split spec file into sections
   # Each section starts with a section line, such as '%package doc', '%build'
   def read_sections
-    @sections = []
+    @sections = {}
     begin
       f = File.new(@path)
     rescue IOError => e
       raise IOError.new("Failed to read #{@path}")
     end
     section = ['%package'] # fake section for the main package
+    package_name = 'main'
     f.each_line do |line|
       line = line.strip
       # Skip empty lines and comments
       next if line.length == 0 or line.start_with?('#')
       # Handle section lines(e.g. %package doc)
-      section, args = line.start_with?('%') ? self.get_section_and_args(line) : [nil, nil]
-      if section.nil? or self.macro_type(section) != :section
+      section_name, args = line.start_with?('%') ? self.get_section_and_args(line) : [nil, nil]
+      if section_name.nil? or self.macro_type(section_name) != :section
         section.push(line)
       else
         # Save the previous section
-        @sections.push(section.join("\n"))
+        @sections[package_name] = {} if @sections[package_name].nil?
+        @sections[package_name][section_name] = section.join("\n")
+        # Parse the section
+        self.parse_section(@sections[package_name][section_name])
         # Create a new section
         section = [line]
       end
     end
     # Save the last section
-    @sections.push(section.join("\n"))
+    @sections[package_name] = {} if @sections[package_name].nil?
+    @sections[package_name][section_name] = section.join("\n")
+    # Parse the section
+    self.parse_section(@sections[package_name][section_name])
     # Close the file
     f.close
   end
@@ -153,36 +160,36 @@ class RpmSpecParser
   # Params:
   #   line - The line to be parsed. Example: "%package doc"
   # Return:
-  #   section - Macro name. Example: "%package"
-  #   args    - Arguments, such as subpackage name, program to run
+  #   section_name  - Macro name. Example: "%package"
+  #   args          - Arguments, such as subpackage name, program to run
   def get_section_and_args(line)
     return nil, nil unless line.start_with?('%')
     line =~ /^(%\w+)\s*(.*)$/
     return nil, nil if $~.nil?
     # get macro name and its value
-    section = $~[1]
+    section_name = $~[1]
     args = ($~[2].length == 0) ? nil : $~[2]
-    return section, args
+    return section_name, args
   end
 
   # Parse the args of a section
   # Params:
-  #   section  - Name of the section, including the % sign at the beginning
+  #   section_name  - Name of the section, including the % sign at the beginning
   #   arg_list      - Array of argument list(similar to ARGV)
   # Return:
   #   parsed_args   - Parsed arguments, e.g. {:args => [], :opts => {}}
-  def parse_section_args!(section, arg_list)
+  def parse_section_args!(section_name, arg_list)
     parsed_args = {:args => [], :opts => {}}
     opt_parser = OptionParser.new do |opts|
       opts.on('-n', 'Do not include primary package name in subpackage name') do
-        if ['%description', '%files', '%changelog',
-            '%pre', '%preun', '%post', '%postun'].include?(section)
+        if ['%description', '%files', '%changelog', '%package',
+            '%pre', '%preun', '%post', '%postun'].include?(section_name)
           parsed_args[:opts]['-n'] = true
         end
       end
 
       opts.on('-f [FILE]', String, 'Read file list from a file') do |file|
-        if section == '%files'
+        if section_name == '%files'
           file = self.expand_macros(file)
           parsed_args[:opts]['-f'] = [] if parsed_args[:opts]['-f'].nil?
           parsed_args[:opts]['-f'].push(file)
@@ -190,7 +197,7 @@ class RpmSpecParser
       end
 
       opts.on('-p [PROGRAM]', String, 'Program to run') do |program|
-        if ['%pre', '%preun', '%post', '%postun'].include?(section)
+        if ['%pre', '%preun', '%post', '%postun'].include?(section_name)
           program = self.expand_macros(program)
           parsed_args[:opts]['-p'] = program
         end
@@ -210,8 +217,8 @@ class RpmSpecParser
 
   def get_package_name(line_or_parsed_args)
     if line_or_parsed_args.instance_of?(String)
-      section, args = self.get_section_and_args(line_or_parsed_args)
-      line_or_parsed_args = self.parse_section_args!(section, args.split(' '))
+      section_name, args = self.get_section_and_args(line_or_parsed_args)
+      line_or_parsed_args = self.parse_section_args!(section_name, args.split(' '))
     end
     arg = line_or_parsed_args[:args][-1]
     if line_or_parsed_args[:opts]['-n'] == true
@@ -224,14 +231,7 @@ class RpmSpecParser
   end
 
   # Parse %packge section
-  def parse_package_section(section)
-    iter = section.each_line
-    # Section line
-    line = iter.next()
-    section, args = self.get_section_and_args(line)
-    raise InvalidSpecError.new("parse_package_section: '#{section}' is not a %package section")
-    parsed_args = self.parse_section_args!(section, args)
-    package = self.get_package_name(line)
+  def parse_package_section_content(package_name, iter)
     loop do
       begin
         line = iter.next()
@@ -244,7 +244,7 @@ class RpmSpecParser
       tag = $~[1]
       value = $~[2]
       # Set macro values if it's main package
-      if package == 'main'
+      if package_name == 'main'
         if ['Name', 'Version', 'Release'].include?(tag)
           self.set_macro_value(tag.downcase, value) 
           self.set_macro_value('ver', value) if tag == 'Version'
@@ -256,7 +256,7 @@ class RpmSpecParser
   end
 
   # Parse %packge section
-  def parse_normal_section(section)
+  def parse_normal_section(package, section)
     iter = section.each_line
     # Section line
     line = iter.next()
@@ -273,10 +273,17 @@ class RpmSpecParser
     end
   end
 
-
   def parse_section(section)
-    if section.start_with?('%package')
-      return self.parse_package_section(section)
+    iter = section.each_line
+    # Section line
+    line = iter.next
+    section_name, args = self.get_section_and_args(line)
+    parsed_args = self.parse_section_args!(section_name, args)
+    package_name = self.get_package_name(line)
+    if section_name == '%package'
+      self.parse_package_section_content(package_name, iter)
+    else
+      self.parse_normal_section_content(package_name, iter)
     end
   end
 end
