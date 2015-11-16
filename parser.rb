@@ -14,11 +14,12 @@ end
 
 
 class RpmSpecParser
-  attr_reader :sections, :path
+  attr_reader :sections, :path, :macros, :vars, :tags
 
+  # %endoffile is a fake section name served as an edge protector
   SECTIONS            = ['%build', '%description', '%files', '%package',
                         '%install', '%prep', '%changelog', '%clean', '%check',
-                        '%pre', '%post', '%preun', '%postun', '%verifyscript']
+                        '%pre', '%post', '%preun', '%postun', '%verifyscript', '%endoffile']
 
   CONDITIONAL_MACROS  = ['%if', '%else', '%endif']
 
@@ -29,10 +30,11 @@ class RpmSpecParser
     unless File.exists?(spec_file)
       raise InvalidSpecError.new("#{spec_file}: No such file")
     end
-    @path   = spec_file
-    @macros = {}
-    @vars   = {}
-    @tags   = {}
+    @path     = spec_file
+    @sections = {}
+    @macros   = {}
+    @vars     = {}
+    @tags     = {}
   end
 
   # Detect macro type
@@ -54,44 +56,6 @@ class RpmSpecParser
     # Other macros like %setup, %dir
     # will be considered as normal lines
     return nil
-  end
-
-  # Read and split spec file into sections
-  # Each section starts with a section line, such as '%package doc', '%build'
-  def read_sections
-    @sections = {}
-    begin
-      f = File.new(@path)
-    rescue IOError => e
-      raise IOError.new("Failed to read #{@path}")
-    end
-    section = ['%package'] # fake section for the main package
-    package_name = 'main'
-    f.each_line do |line|
-      line = line.strip
-      # Skip empty lines and comments
-      next if line.length == 0 or line.start_with?('#')
-      # Handle section lines(e.g. %package doc)
-      section_name, args = line.start_with?('%') ? self.get_section_and_args(line) : [nil, nil]
-      if section_name.nil? or self.macro_type(section_name) != :section
-        section.push(line)
-      else
-        # Save the previous section
-        @sections[package_name] = {} if @sections[package_name].nil?
-        @sections[package_name][section_name] = section.join("\n")
-        # Parse the section
-        self.parse_section(@sections[package_name][section_name])
-        # Create a new section
-        section = [line]
-      end
-    end
-    # Save the last section
-    @sections[package_name] = {} if @sections[package_name].nil?
-    @sections[package_name][section_name] = section.join("\n")
-    # Parse the section
-    self.parse_section(@sections[package_name][section_name])
-    # Close the file
-    f.close
   end
 
   # Get tag value
@@ -167,8 +131,7 @@ class RpmSpecParser
     line =~ /^(%\w+)\s*(.*)$/
     return nil, nil if $~.nil?
     # get macro name and its value
-    section_name = $~[1]
-    args = ($~[2].length == 0) ? nil : $~[2]
+    section_name, args = $~[1], $~[2]
     return section_name, args
   end
 
@@ -215,23 +178,24 @@ class RpmSpecParser
     return parsed_args
   end
 
-  def get_package_name(line_or_parsed_args)
-    if line_or_parsed_args.instance_of?(String)
-      section_name, args = self.get_section_and_args(line_or_parsed_args)
-      line_or_parsed_args = self.parse_section_args!(section_name, args.split(' '))
-    end
-    arg = line_or_parsed_args[:args][-1]
-    if line_or_parsed_args[:opts]['-n'] == true
+  def get_package_name(parsed_args)
+    arg = parsed_args[:args][-1]
+    if parsed_args[:opts]['-n'] == true
       return arg.nil? ? 'main' : arg
     else
       name = self.get_macro_value('name')
-      raise InvalidSpecError.new("get_package_name: Failed to get main package name")
+      if (not arg.nil?) and name.nil?
+        raise InvalidSpecError.new("get_package_name: Failed to get main package name")
+      end
       return arg.nil? ? 'main' : "#{name}-#{arg}"
     end
   end
 
-  # Parse %packge section
-  def parse_package_section_content(package_name, iter)
+  # Parse %packge section(without the %package line)
+  # Params:
+  #   package_name  - Name of the (sub)package
+  #   iter          - iterator of the section string
+  def _parse_package_section_content(package_name, iter)
     loop do
       begin
         line = iter.next()
@@ -251,42 +215,70 @@ class RpmSpecParser
         end
       end
       # Set tag name
-      self.set_tag_value(package, tag, value)
+      self.set_tag_value(package_name, tag, value)
     end
   end
 
-  # Parse %packge section
-  def parse_normal_section(package, section)
-    iter = section.each_line
-    # Section line
-    line = iter.next()
-    section, args = self.get_section_and_args(line)
-    raise InvalidSpecError.new("parse_package_section: '#{section}' is not a %package section")
-    parsed_args = self.parse_section_args!(section, args)
-    package = self.get_package_name(line)
-    loop do
-      begin
-        line = iter.next()
-      rescue StopIteration
-        break
-      end
-    end
-  end
-
+  # Parse section string
   def parse_section(section)
     iter = section.each_line
     # Section line
     line = iter.next
     section_name, args = self.get_section_and_args(line)
-    parsed_args = self.parse_section_args!(section_name, args)
-    package_name = self.get_package_name(line)
+    parsed_args = self.parse_section_args!(section_name, args.split(' '))
+    package_name = self.get_package_name(parsed_args)
     if section_name == '%package'
-      self.parse_package_section_content(package_name, iter)
-    else
-      self.parse_normal_section_content(package_name, iter)
+      self._parse_package_section_content(package_name, iter)
     end
+  end
+
+  # Read and split spec file into sections
+  # Each section starts with a section line, such as '%package doc', '%build'
+  def read_sections
+    @sections.clear
+    begin
+      f = File.new(@path)
+    rescue IOError => e
+      raise IOError.new("Failed to read #{@path}")
+    end
+    section = ['%package']    # fake section for the main package
+    package_name = 'main'
+    section_name = '%package'
+    iter = f.each_line
+    line = ''
+    while line != "%endoffile"
+      begin
+        line = iter.next.strip
+      rescue StopIteration
+        line = "%endoffile"   # Edge protector
+      end
+      # Skip empty lines and comments
+      next if line.length == 0 or line.start_with?('#')
+      # Handle section lines(e.g. %package doc)
+      name, args = line.start_with?('%') ? self.get_section_and_args(line) : [nil, nil]
+      if name.nil? or self.macro_type(name) != :section
+        section.push(line)
+      else
+        # Save the previous section
+        @sections[package_name] = {} if @sections[package_name].nil?
+        @sections[package_name][section_name] = section.join("\n")
+        # Parse the section
+        self.parse_section(@sections[package_name][section_name])
+        # Create a new section
+        section_name = name
+        section = [line]
+      end
+    end
+    # Close the file
+    f.close
   end
 end
 
 parser = RpmSpecParser.new('../spec-parser/foo.spec')
-puts parser.get_package_name({:args => ['foo', 'doc'], :opts => {'-n' => false}})
+parser.read_sections
+parser.sections.each_pair do |package, sections|
+  puts "="*20 + package + "="*20
+  sections.each_pair do |key, value|
+    puts "#{key}=\n#{value}\n\n"
+  end
+end
