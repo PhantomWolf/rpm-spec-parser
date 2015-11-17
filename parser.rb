@@ -261,11 +261,16 @@ class RpmSpecParser
       else
         # Save the previous section
         @sections[package_name] = {} if @sections[package_name].nil?
+        if @sections[package_name].has_key?(section_name)
+          raise InvalidSpecError.new("#{spec_file}: Duplicated section: #{line}")
+        end
         @sections[package_name][section_name] = section.join("\n")
         # Parse the section
         self.parse_section(@sections[package_name][section_name])
         # Create a new section
         section_name = name
+        parsed_args = self.parse_section_args!(section_name, args.split(' '))
+        package_name = self.get_package_name(parsed_args)
         section = [line]
       end
     end
@@ -274,11 +279,8 @@ class RpmSpecParser
   end
 end
 
-parser = RpmSpecParser.new('../spec-parser/foo.spec')
+parser = RpmSpecParser.new('../spec-parser/xfsprogs.spec')
 parser.read_sections
-parser.sections.each_pair do |package, sections|
-  puts "="*20 + package + "="*20
-  sections.each_pair do |key, value|
-    puts "#{key}=\n#{value}\n\n"
-  end
-end
+puts JSON.pretty_generate(parser.sections)
+puts JSON.pretty_generate(parser.macros)
+puts JSON.pretty_generate(parser.tags)
